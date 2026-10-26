@@ -95,6 +95,15 @@ class ConvertTest(unittest.TestCase):
         self.assertEqual(data["insee"], "38001")
         self.assertEqual([lot[0] for lot in data["lots"]], ["0000450", "0000451"])  # tri par date
 
+    def test_names_and_integrator_version_in_index(self):
+        out, index, _ = self.convert(SAMPLE, names_provider=lambda insees: {"38001": "Abc", "38002": "Déf", "99999": "Hors"})
+        self.assertEqual(index["communes"]["38001"], {"lots": 2, "nom": "Abc"})
+        self.assertEqual(index["communes"]["38003"], {"lots": 1}, "commune sans nom : pas de champ nom")
+        self.assertNotIn("99999", index["communes"])
+        self.assertEqual(index["integrateur"], dfi_data.__version__)
+        self.assertEqual(index["format"], 1, "champ additif : le format de sortie ne change pas")
+        self.assertEqual(json.loads((out / "index.json").read_text())["communes"]["38002"]["nom"], "Déf")
+
     def test_filter_and_missing_commune(self):
         out, index, warnings = self.convert(SAMPLE, wanted={"38001", "38999"})
         self.assertEqual(sorted(index["communes"]), ["38001"])
@@ -122,6 +131,55 @@ class VersionTest(unittest.TestCase):
         match = re.search(r"^## \[(\d+\.\d+\.\d+)\]", changelog, re.MULTILINE)
         self.assertIsNotNone(match)
         self.assertEqual(dfi_data.__version__, match.group(1))
+
+
+class NamesTest(unittest.TestCase):
+    """Noms des communes : API Géo simulée."""
+
+    def fake(self, data, calls=None):
+        def fetch(url):
+            if calls is not None:
+                calls.append(url)
+            for key, value in data.items():
+                if key in url:
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
+            return []
+        return fetch
+
+    def test_department_of(self):
+        self.assertEqual([dfi_data.department_of(c) for c in ("38544", "2A004", "2B033", "97101", "97611", "75101", "01001")],
+                         ["38", "2A", "2B", "971", "976", "75", "01"])
+
+    def test_names_by_department_and_second_call_for_other_types(self):
+        calls = []
+        data = {"codeDepartement=69&fields=nom,code&type=": [{"code": "69381", "nom": "Lyon 1er Arrondissement"}],
+                "codeDepartement=69&fields=nom,code": [{"code": "69007", "nom": "Ampuis"}, {"code": "69999", "nom": "Hors périmètre"}],
+                "codeDepartement=38": [{"code": "38544", "nom": "Vienne"}]}
+        logs = []
+        names = dfi_data.fetch_commune_names(["38544", "69007", "69381", "69888"], fetch=self.fake(data, calls), log=logs.append)
+        self.assertEqual(names, {"38544": "Vienne", "69007": "Ampuis", "69381": "Lyon 1er Arrondissement"})
+        self.assertEqual(len(calls), 3, "38 : 1 appel (tout résolu) ; 69 : 2 appels (communes actuelles, puis les autres types)")
+        self.assertTrue(any("type=arrondissement-municipal,commune-associee,commune-deleguee" in c for c in calls))
+        self.assertTrue(any("3 sur 4" in line and "1 sans nom" in line for line in logs), logs)
+
+    def test_failure_reuses_previous_names_and_never_raises(self):
+        previous = {"communes": {"38544": {"lots": 1, "nom": "Vienne"}, "38001": {"lots": 1}}}
+        logs = []
+        names = dfi_data.fetch_commune_names(["38544", "38001"], previous, self.fake({"codeDepartement=38": dfi_data.DownloadError("hors ligne")}), logs.append)
+        self.assertEqual(names, {"38544": "Vienne"})
+        self.assertTrue(any("indisponibles" in line for line in logs))
+        self.assertTrue(any("dont 1 repris de l'index précédent" in line for line in logs))
+
+    def test_partial_failure_keeps_other_departments(self):
+        data = {"codeDepartement=38": dfi_data.DownloadError("x"), "codeDepartement=69": [{"code": "69007", "nom": "Ampuis"}]}
+        names = dfi_data.fetch_commune_names(["38544", "69007"], fetch=self.fake(data), log=lambda m: None)
+        self.assertEqual(names, {"69007": "Ampuis"})
+
+    def test_get_json_rejects_insecure_scheme(self):
+        with self.assertRaises(dfi_data.DownloadError):
+            dfi_data.get_json("http://exemple.invalid/x")
 
 
 class DiscoverTest(unittest.TestCase):
@@ -156,9 +214,11 @@ class DownloadTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
-        patcher = unittest.mock.patch.object(dfi_data, "ALLOWED_SCHEMES", ("https", "file"))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in (unittest.mock.patch.object(dfi_data, "ALLOWED_SCHEMES", ("https", "file")),
+                        # aucun appel réseau pour les noms de communes (les tests de noms fournissent leur propre service)
+                        unittest.mock.patch.object(dfi_data, "get_json", lambda url, attempts=3: [])):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def make_zip(self, name, members):
         path = self.tmp / name
@@ -245,6 +305,56 @@ class DownloadTest(unittest.TestCase):
         self.assertIsNotNone(dfi_data.download(["38"], fresh, cache, previous_index=missing,
                                                api_url=api, log=logs.append))
         self.assertTrue(any("Index précédent inutilisable" in message for message in logs))
+
+    def test_download_with_names_and_integrator_version_regeneration(self):
+        zip38 = self.make_zip("a.zip", {"dfiano-dep380-01072026.txt": SAMPLE})
+        api = self.make_api([resource("id38", "DFI (situation juillet 2026).zip", zip38.as_uri())])
+        out, cache = self.tmp / "out", self.tmp / "cache"
+        fetcher = lambda url: [{"code": "38001", "nom": "Abc"}] if "codeDepartement=38" in url else []
+        index, _ = dfi_data.download(["38"], out, cache, api_url=api, log=lambda m: None, names_fetcher=fetcher)
+        self.assertEqual(index["communes"]["38001"]["nom"], "Abc"); self.assertNotIn("nom", index["communes"]["38002"])
+        self.assertEqual(index["integrateur"], dfi_data.__version__)
+        quiet = dict(api_url=api, log=lambda m: None, names_fetcher=fetcher)
+        self.assertIsNone(dfi_data.download(["38"], out, cache, **quiet), "même situation, même version : rien à faire")
+        # un index publié par une version plus ancienne de l'intégrateur (sans noms) est régénéré
+        old = json.loads((out / "index.json").read_text()); old["integrateur"] = "0.1.0"
+        (out / "index.json").write_text(json.dumps(old))
+        again = dfi_data.download(["38"], out, cache, **quiet)
+        self.assertIsNotNone(again); self.assertEqual(again[0]["integrateur"], dfi_data.__version__)
+        # service des noms indisponible : on garde les noms de l'index précédent
+        def down(url): raise dfi_data.DownloadError("hors ligne")
+        kept, _ = dfi_data.download(["38"], out, cache, force=True, api_url=api, log=lambda m: None, names_fetcher=down)
+        self.assertEqual(kept["communes"]["38001"]["nom"], "Abc")
+        # --no-names : aucune requête
+        calls = []
+        dfi_data.download(["38"], out, cache, force=True, api_url=api, log=lambda m: None, fetch_names=False, names_fetcher=lambda u: calls.append(u) or [])
+        self.assertEqual(calls, [])
+
+    def test_all_departments_converted_one_file_at_a_time(self):
+        other = SAMPLE.replace("380;", "690;")
+        zip_a = self.make_zip("a.zip", {"dfiano-dep380-01072026.txt": SAMPLE, "dfiano-dep2A0-02072026.txt": SAMPLE.replace("380;", "2A0;")})
+        zip_b = self.make_zip("b.zip", {"dfiano-dep690-01072026.txt": other, "dfiano-dep976-01072026.txt": SAMPLE.replace("380;", "976;001;")[:0] + SAMPLE.replace("380;001;", "976;001;").replace("380;002;", "976;002;").replace("380;003;", "976;003;")})
+        api = self.make_api([resource("a", "DFI (situation juillet 2026) - A.zip", zip_a.as_uri()), resource("b", "DFI (situation juillet 2026) - B.zip", zip_b.as_uri())])
+        out, cache = self.tmp / "out", self.tmp / "cache"
+        index, _ = dfi_data.download(["all"], out, cache, api_url=api, log=lambda m: None)
+        self.assertEqual(index["departements"], ["all"])
+        self.assertTrue({"38001", "69001", "2A001", "97001"} <= set(index["communes"]), sorted(index["communes"]))
+        self.assertIsNone(dfi_data.download(["all"], out, cache, api_url=api, log=lambda m: None))
+        # un périmètre explicite est un autre périmètre
+        self.assertIsNotNone(dfi_data.download(["38"], out, cache, api_url=api, log=lambda m: None))
+
+    def test_iter_extracted_deletes_each_file_after_use(self):
+        zip_a = self.make_zip("a.zip", {"dfiano-dep380-01072026.txt": SAMPLE, "dfiano-dep690-01072026.txt": SAMPLE, "dossier/x.txt": "ignoré"})
+        members = dfi_data.list_members([zip_a], None)
+        self.assertEqual(sorted(members), ["380", "690"], "le motif exclut les chemins et les autres fichiers")
+        work = self.tmp / "work"; work.mkdir()
+        seen = []
+        for path in dfi_data.iter_extracted(members, work):
+            seen.append(path.name); self.assertTrue(path.exists()); self.assertEqual(len(list(work.iterdir())), 1, "un seul fichier à la fois")
+        self.assertEqual(seen, ["dfiano-dep380-01072026.txt", "dfiano-dep690-01072026.txt"]); self.assertEqual(list(work.iterdir()), [])
+        with self.assertRaises(dfi_data.DownloadError):
+            dfi_data.list_members([zip_a, self.make_zip("b.zip", {"dfiano-dep380-02072026.txt": SAMPLE})], None)
+        self.assertEqual(sorted(dfi_data.list_members([zip_a], {"690"})), ["690"])
 
     def test_exit_code_when_up_to_date(self):
         zip38 = self.make_zip("a.zip", {"dfiano-dep380-01072026.txt": SAMPLE})

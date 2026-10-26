@@ -5,8 +5,9 @@ Source : https://www.data.gouv.fr/datasets/documents-de-filiation-informatises-d
 Format de sortie : voir README.md.
 
 Usage :
-    python3 -I integrator_dfi.py convert FICHIER... --output DOSSIER [--insee CODE...]
+    python3 -I integrator_dfi.py convert FICHIER... --output DOSSIER [--insee CODE...] [--no-names]
     python3 -I integrator_dfi.py download --departments 38 69 --output DOSSIER [--cache DOSSIER]
+    python3 -I integrator_dfi.py download --departments all --output DOSSIER      (toute la France)
 """
 import argparse
 import datetime
@@ -25,7 +26,7 @@ from pathlib import Path
 
 # Version de l'intégrateur (la même que la première entrée numérotée de CHANGELOG.md ; vérifié par les tests et par
 # scripts/publish-module.sh). Distincte de FORMAT_VERSION, qui est celle du format de sortie.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 SOURCE = "DGFiP, Documents de filiation informatisés (DFI) des parcelles"
 LICENSE = "Licence Ouverte 2.0"
@@ -33,6 +34,9 @@ LICENSE = "Licence Ouverte 2.0"
 # incompatible (structure d'un lot, clés de l'index) ; un ajout qui laisse les lecteurs existants fonctionner n'y touche pas.
 FORMAT_VERSION = 1
 API_URL = "https://www.data.gouv.fr/api/1/datasets/documents-de-filiation-informatises-dfi-des-parcelles/"
+# Noms des communes (API Géo, Etalab) : les fichiers de la DGFiP ne donnent que le code INSEE
+GEO_API_URL = "https://geo.api.gouv.fr/communes"
+GEO_OTHER_TYPES = "arrondissement-municipal,commune-associee,commune-deleguee"
 USER_AGENT = "integrator-dfi (geo-api-v2)"
 MONTHS = {"janvier": 1, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6, "juillet": 7,
           "aout": 8, "septembre": 9, "octobre": 10, "novembre": 11, "decembre": 12}
@@ -148,10 +152,11 @@ def duplicate_daughters(lots):
     return sorted(parcel for parcel, count in seen.items() if count > 1)
 
 
-def convert(inputs, output, wanted=None, extra=None):
+def convert(inputs, output, wanted=None, extra=None, names_provider=None):
     """Convertit des fichiers départementaux et écrit un JSON par commune plus index.json.
 
-    `extra` : informations ajoutées à l'index (origine des fichiers, périmètre demandé).
+    `extra` : informations ajoutées à l'index (origine des fichiers, périmètre demandé). `inputs` peut être un générateur
+    (les fichiers sont lus un par un). `names_provider(codes INSEE) -> {insee: nom}` ajoute le nom de chaque commune à l'index.
     """
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -186,8 +191,13 @@ def convert(inputs, output, wanted=None, extra=None):
         missing = sorted(wanted - set(communes))
         if missing:
             warnings.append("communes demandées absentes des fichiers : " + ", ".join(missing))
+    if names_provider:
+        for insee, nom in names_provider(sorted(communes)).items():
+            if insee in communes and nom:
+                communes[insee]["nom"] = nom
     index = {
         "format": FORMAT_VERSION,
+        "integrateur": __version__,
         "source": SOURCE,
         "licence": LICENSE,
         "situation": max(dates).isoformat() if dates else None,
@@ -263,18 +273,95 @@ def download_file(url, destination):
     return True
 
 
-def extract_departments(zip_path, codes, workdir):
-    """Extrait du zip les fichiers des départements demandés. Retourne {code: chemin}."""
-    extracted = {}
-    with zipfile.ZipFile(zip_path) as archive:
-        for name in archive.namelist():
-            match = MEMBER_RE.match(name)  # le motif exclut tout séparateur de chemin
-            if match and match.group(1) in codes:
-                target = Path(workdir) / name
-                with archive.open(name) as source, open(target, "wb") as out:
-                    shutil.copyfileobj(source, out, 1 << 20)
-                extracted[match.group(1)] = target
-    return extracted
+def list_members(zip_paths, codes):
+    """Fichiers départementaux des zip : { code: (zip, nom du fichier) }, sans rien extraire.
+
+    `codes` : codes départementaux voulus (3 caractères), ou None pour tous. Le motif du nom exclut tout séparateur de chemin.
+    """
+    found = {}
+    for zip_path in zip_paths:
+        with zipfile.ZipFile(zip_path) as archive:
+            for name in archive.namelist():
+                match = MEMBER_RE.match(name)
+                if match and (codes is None or match.group(1) in codes):
+                    if match.group(1) in found:
+                        raise DownloadError(f"le département {match.group(1)} figure dans plusieurs zip")
+                    found[match.group(1)] = (zip_path, name)
+    return found
+
+
+def iter_extracted(members, workdir):
+    """Extrait un fichier à la fois et le supprime dès que l'appelant a fini de le lire (toute la France pèse plus de 1 Go)."""
+    for code in sorted(members):
+        zip_path, name = members[code]
+        target = Path(workdir) / name
+        with zipfile.ZipFile(zip_path) as archive, archive.open(name) as source, open(target, "wb") as out:
+            shutil.copyfileobj(source, out, 1 << 20)
+        try:
+            yield target
+        finally:
+            target.unlink(missing_ok=True)
+
+
+def department_of(insee):
+    """Département d'un code INSEE : « 38544 » -> « 38 », « 2A004 » -> « 2A », « 97101 » -> « 971 »."""
+    return insee[:3] if insee.startswith("97") else insee[:2]
+
+
+def get_json(url, attempts=3):
+    """GET d'un JSON avec quelques essais (le service des noms peut être lent ou indisponible un instant)."""
+    if urllib.parse.urlparse(url).scheme not in ALLOWED_SCHEMES:
+        raise DownloadError(f"adresse non autorisée : {url}")
+    last = None
+    for attempt in range(attempts):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response)
+        except (OSError, ValueError) as error:
+            last = error
+    raise DownloadError(f"{url} : {last}")
+
+
+def fetch_commune_names(insees, previous=None, fetch=None, log=print):
+    """Noms des communes : { INSEE: nom }, par un appel de l'API Géo par département.
+
+    Les communes actuelles d'abord ; si certains codes restent sans nom (arrondissements de Paris, Lyon et Marseille, communes
+    associées ou déléguées), un second appel couvre ces types. En cas d'échec, le nom de l'index précédent est repris (`previous`) :
+    une indisponibilité du service ne retire jamais un nom déjà publié. Ne lève jamais d'exception.
+    """
+    fetch = fetch or get_json
+    names = {}
+    by_department = defaultdict(list)
+    for insee in insees:
+        by_department[department_of(insee)].append(insee)
+    for department, codes in sorted(by_department.items()):
+        wanted = set(codes)
+        for types in (None, GEO_OTHER_TYPES):
+            todo = wanted - set(names)
+            if not todo:
+                break
+            url = f"{GEO_API_URL}?codeDepartement={urllib.parse.quote(department)}&fields=nom,code"
+            if types:
+                url += "&type=" + types
+            try:
+                for commune in fetch(url):
+                    if commune.get("code") in todo and commune.get("nom"):
+                        names.setdefault(commune["code"], commune["nom"])
+            except (DownloadError, TypeError, AttributeError) as error:
+                log(f"Avertissement : noms des communes du département {department} indisponibles ({error})")
+                break
+    reused = 0
+    for insee in insees:
+        if insee not in names:
+            old = ((previous or {}).get("communes") or {}).get(insee, {}).get("nom")
+            if old:
+                names[insee] = old
+                reused += 1
+    missing = len(insees) - len(names)
+    log(f"Noms des communes : {len(names)} sur {len(insees)}" + (f" (dont {reused} repris de l'index précédent)" if reused else "")
+        + (f", {missing} sans nom" if missing else ""))
+    return names
 
 
 def default_cache():
@@ -300,13 +387,16 @@ def load_previous_index(source, log):
         return None
 
 
-def download(departments, output, cache, wanted=None, force=False, api_url=API_URL, log=print, previous_index=None):
+def download(departments, output, cache, wanted=None, force=False, api_url=API_URL, log=print, previous_index=None,
+             fetch_names=True, names_fetcher=None):
     """Télécharge la dernière situation des DFI et la convertit. Retourne (index, avertissements) ou None.
 
-    None signifie « déjà à jour » : l'index précédent (`previous_index`, par défaut `output/index.json`)
-    porte les mêmes ressources et le même périmètre.
+    None signifie « déjà à jour » : l'index précédent (`previous_index`, par défaut `output/index.json`) porte les mêmes
+    ressources, le même périmètre, le même format de sortie et la même version de l'intégrateur.
+    `departments` : codes (38, 2A, 971…) ou « all » pour toute la France.
     """
-    codes = {department_file_code(department) for department in departments}
+    everything = any(str(d).lower() == "all" for d in departments)
+    codes = None if everything else {department_file_code(department) for department in departments}
     request = urllib.request.Request(api_url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=60) as response:
         dataset = json.load(response)
@@ -315,31 +405,32 @@ def download(departments, output, cache, wanted=None, force=False, api_url=API_U
         log(f"Avertissement : ressource ignorée (situation illisible) : {title}")
     log(f"Situation retenue : {month:02d}/{year}, {len(resources)} zip")
     ids = sorted(resource["id"] for resource in resources)
-    scope = {"departements": sorted(departments), "insee": sorted(wanted) if wanted else None}
-    if not force:
-        previous = load_previous_index(previous_index or Path(output) / "index.json", log)
-        # Un autre format de sortie impose de régénérer, même si la situation de data.gouv n'a pas changé
-        if previous and previous.get("format") == FORMAT_VERSION and previous.get("ressources") == ids \
-                and all(previous.get(key) == value for key, value in scope.items()):
-            log("Données déjà à jour (utiliser --force pour régénérer)")
-            return None
+    scope = {"departements": ["all"] if everything else sorted(departments), "insee": sorted(wanted) if wanted else None}
+    previous = load_previous_index(previous_index or Path(output) / "index.json", log)
+    if not force and previous and previous.get("format") == FORMAT_VERSION and previous.get("ressources") == ids \
+            and previous.get("integrateur") == __version__ and all(previous.get(key) == value for key, value in scope.items()):
+        log("Données déjà à jour (utiliser --force pour régénérer)")
+        return None
     cache = Path(cache)
     cache.mkdir(parents=True, exist_ok=True)
-    files = {}
+    zips = []
+    for resource in resources:
+        zip_path = cache / f"{resource['id']}.zip"
+        fresh = download_file(resource["latest"], zip_path)
+        log(f"{'Téléchargé' if fresh else 'Déjà en cache'} : {resource['title']}")
+        zips.append(zip_path)
+    members = list_members(zips, codes)
+    if codes is not None and set(codes) - set(members):
+        raise DownloadError("départements absents des zip : " + ", ".join(sorted(set(codes) - set(members))))
+    if not members:
+        raise DownloadError("aucun fichier départemental dans les zip")
+    log(f"{len(members)} fichier(s) départemental(aux) à convertir")
+    names_provider = None
+    if fetch_names:
+        names_provider = lambda insees: fetch_commune_names(insees, previous, names_fetcher or get_json, log)
+    extra = {"millesime": f"{year}-{month:02d}", "ressources": ids, **scope}
     with tempfile.TemporaryDirectory(dir=cache) as work:
-        for resource in resources:
-            zip_path = cache / f"{resource['id']}.zip"
-            fresh = download_file(resource["latest"], zip_path)
-            log(f"{'Téléchargé' if fresh else 'Déjà en cache'} : {resource['title']}")
-            for code, path in extract_departments(zip_path, codes, work).items():
-                if code in files:
-                    raise DownloadError(f"le département {code} figure dans plusieurs zip")
-                files[code] = path
-        missing = sorted(codes - set(files))
-        if missing:
-            raise DownloadError("départements absents des zip : " + ", ".join(missing))
-        extra = {"millesime": f"{year}-{month:02d}", "ressources": ids, **scope}
-        return convert([files[code] for code in sorted(files)], output, wanted, extra)
+        return convert(iter_extracted(members, work), output, wanted, extra, names_provider)
 
 
 def main(argv=None):
@@ -350,8 +441,10 @@ def main(argv=None):
     conv.add_argument("--output", required=True, help="dossier de sortie")
     conv.add_argument("--insee", nargs="+", default=None, help="ne garder que ces communes (codes INSEE)")
     conv.add_argument("--strict", action="store_true", help="échouer s'il y a des avertissements")
+    conv.add_argument("--no-names", action="store_true", help="ne pas chercher les noms des communes (hors ligne)")
     down = sub.add_parser("download", help="télécharge la dernière situation sur data.gouv et la convertit")
-    down.add_argument("--departments", nargs="+", required=True, help="départements voulus (38 69 2A 971…)")
+    down.add_argument("--departments", nargs="+", required=True, help="départements voulus (38 69 2A 971…) ou « all » (toute la France)")
+    down.add_argument("--no-names", action="store_true", help="ne pas chercher les noms des communes (hors ligne)")
     down.add_argument("--output", required=True, help="dossier de sortie")
     down.add_argument("--cache", default=str(default_cache()),
                       help="dossier des zip téléchargés (défaut : $XDG_CACHE_HOME/integrator-dfi ou ~/.cache/integrator-dfi)")
@@ -366,10 +459,11 @@ def main(argv=None):
     wanted = set(args.insee) if args.insee else None
     try:
         if args.command == "convert":
-            result = convert(args.inputs, args.output, wanted)
+            result = convert(args.inputs, args.output, wanted,
+                             names_provider=None if args.no_names else (lambda insees: fetch_commune_names(insees)))
         else:
             result = download(args.departments, args.output, args.cache, wanted, args.force,
-                              api_url=args.api_url, previous_index=args.previous_index)
+                              api_url=args.api_url, previous_index=args.previous_index, fetch_names=not args.no_names)
     except (FormatError, DownloadError, OSError, zipfile.BadZipFile, ValueError) as error:
         print(f"Erreur : {error}", file=sys.stderr)
         return 1

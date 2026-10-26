@@ -10,6 +10,18 @@ sortie** (`format` dans `index.json`) est distincte : elle est notée ici quand 
 
 ## [Non publié]
 
+## [0.2.0] — 2026-10-26
+
+### Ajouté
+
+- Le nom de chaque commune dans `index.json` (champ `nom`), pour que les modules proposent « Vienne » et non « 38544 ». Les noms viennent de
+  l'API Géo (geo.api.gouv.fr), avec les arrondissements de Paris, Lyon et Marseille et les communes associées ou déléguées ; si le service
+  est indisponible, le nom de l'index précédent est repris, sinon la commune reste sans nom. `--no-names` désactive cette étape (hors ligne)
+- `--departments all` : tous les départements des fichiers de la DGFiP (métropole, Corse et outre-mer), un fichier à la fois pour ne pas
+  saturer le disque
+- L'index porte la version de l'intégrateur (`integrateur`) : passer à une nouvelle version régénère les données même si la situation de
+  data.gouv n'a pas changé
+
 ## [0.1.0] — 2026-10-26
 
 ### Ajouté

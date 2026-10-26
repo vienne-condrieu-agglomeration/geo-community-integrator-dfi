@@ -14,6 +14,7 @@ Python 3, bibliothèque standard uniquement.
 ```bash
 # Télécharger la dernière situation sur data.gouv et la convertir (départements 38 et 69)
 python3 -I integrator_dfi.py download --departments 38 69 --output sortie/
+python3 -I integrator_dfi.py download --departments all --output sortie/            # toute la France
 python3 -I integrator_dfi.py download --departments 38 69 --insee 38544 38087 --output sortie/   # communes choisies
 
 # Convertir des fichiers déjà extraits
@@ -29,7 +30,8 @@ conversion avec le numéro de ligne.
 
 `download` lit les métadonnées du jeu de données (API de data.gouv), retient les zip de la **situation la plus récente**
 (« situation juillet 2026 » : trimestrielle, en deux zip d'environ 175 Mo), les télécharge par leur adresse stable
-`/api/1/datasets/r/<id>`, puis extrait seulement les départements demandés. `--departments` accepte `38`, `2A`, `971`.
+`/api/1/datasets/r/<id>`, puis extrait seulement les départements demandés. `--departments` accepte `38`, `2A`, `971`, ou `all` (toute la France : les fichiers sont extraits et convertis un par un, sans jamais
+en garder plus d'un sur le disque).
 
 - Les titres de data.gouv comportent des coquilles (`juillet 20266`) et leurs plages de départements ne sont pas fiables :
   seuls le mois et l'année sont lus ; le contenu est vérifié dans le zip. Un département absent des zip fait échouer l'exécution.
@@ -71,8 +73,8 @@ Un lot est `[identifiant du DFI, numéro de lot, nature, date, parcelles mères,
   fusionnée), il est placé devant : `014AH0280`. L'IDU complet est `INSEE` (5) + préfixe (3, `000` par défaut) + parcelle.
 - Les lots sont triés par date, identifiant puis numéro : deux exécutions sur les mêmes données donnent les mêmes fichiers.
 
-`index.json` : `format`, `source`, `licence`, `situation` (date la plus récente lue dans les noms de fichiers), nombre de
-lots par nature et par commune, nombre d'avertissements. Un avertissement signale une parcelle fille de plusieurs lots
+`index.json` : `format`, `integrateur` (version de l'intégrateur), `source`, `licence`, `situation` (date la plus récente lue dans les noms de
+fichiers), nombre de lots par nature et par commune, **nom de la commune** (`nom`), nombre d'avertissements. Un avertissement signale une parcelle fille de plusieurs lots
 d'une même commune (cas absent des départements 38 et 69 de juillet 2026). Avec `download`, l'index porte aussi
 `millesime`, `ressources`, `departements` et `insee`.
 
@@ -94,3 +96,11 @@ Un fichier n'est pas cumulatif d'une situation à l'autre (des lots peuvent disp
 - Aucune dépendance tierce : bibliothèque standard de Python uniquement.
 
 Les contributions se font sous la même licence, avec signature DCO : voir [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Noms des communes
+
+Les fichiers de la DGFiP ne donnent que le code INSEE. À la génération, l'intégrateur interroge l'API Géo (`geo.api.gouv.fr`, un appel par
+département, un second pour les arrondissements de Paris, Lyon et Marseille et les communes associées ou déléguées) et ajoute `nom` à chaque
+commune de `index.json`. Le service est facultatif : s'il est indisponible, les noms de l'index précédent sont repris ; une commune sans nom
+reste valide (les modules affichent alors son code). `--no-names` désactive cette étape (hors ligne). Le champ est additif : le format de
+sortie reste le 1. Changer de version de l'intégrateur régénère les données même si la situation de data.gouv n'a pas changé.
