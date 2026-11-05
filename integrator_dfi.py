@@ -18,6 +18,7 @@ import shutil
 import sys
 import tempfile
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -26,7 +27,7 @@ from pathlib import Path
 
 # Version de l'intégrateur (la même que la première entrée numérotée de CHANGELOG.md ; vérifié par les tests et par
 # scripts/publish-module.sh). Distincte de FORMAT_VERSION, qui est celle du format de sortie.
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 SOURCE = "DGFiP, Documents de filiation informatisés (DFI) des parcelles"
 LICENSE = "Licence Ouverte 2.0"
@@ -52,6 +53,9 @@ PARCEL_RE = re.compile(r"^[0-9A-Z]{2}[0-9]{4}$")
 # Champs avant les cellules de parcelles. Le descriptif PDF en décrit 9 ; le fichier réel en
 # compte 10 (colonne supplémentaire « XNUMX » entre le géomètre et le numéro de lot).
 FIELDS_BEFORE_CELLS = 10
+
+
+UNAVAILABLE_STATUS = (404, 410)   # ressource retirée : à ignorer si les départements demandés restent couverts
 
 
 class FormatError(Exception):
@@ -414,14 +418,27 @@ def download(departments, output, cache, wanted=None, force=False, api_url=API_U
     cache = Path(cache)
     cache.mkdir(parents=True, exist_ok=True)
     zips = []
+    unavailable = []
     for resource in resources:
         zip_path = cache / f"{resource['id']}.zip"
-        fresh = download_file(resource["latest"], zip_path)
+        try:
+            fresh = download_file(resource["latest"], zip_path)
+        except urllib.error.HTTPError as error:
+            # La source republie parfois un zip sous un autre nom en laissant l'ancienne ressource, morte, sur data.gouv.
+            if error.code not in UNAVAILABLE_STATUS:
+                raise
+            log(f"Avertissement : ressource indisponible (HTTP {error.code}), ignorée : {resource['title']}")
+            unavailable.append(resource["title"])
+            continue
         log(f"{'Téléchargé' if fresh else 'Déjà en cache'} : {resource['title']}")
         zips.append(zip_path)
+    # Pour « all », rien ne prouve que les zip restants couvrent tout le territoire.
+    if everything and unavailable:
+        raise DownloadError("toute la France demandée, mais ressources indisponibles : " + " ; ".join(unavailable))
     members = list_members(zips, codes)
     if codes is not None and set(codes) - set(members):
-        raise DownloadError("départements absents des zip : " + ", ".join(sorted(set(codes) - set(members))))
+        detail = " (ressources indisponibles : " + " ; ".join(unavailable) + ")" if unavailable else ""
+        raise DownloadError("départements absents des zip : " + ", ".join(sorted(set(codes) - set(members))) + detail)
     if not members:
         raise DownloadError("aucun fichier départemental dans les zip")
     log(f"{len(members)} fichier(s) départemental(aux) à convertir")

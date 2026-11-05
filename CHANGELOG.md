@@ -10,6 +10,14 @@ sortie** (`format` dans `index.json`) est distincte : elle est notée ici quand 
 
 ## [Non publié]
 
+## [0.2.1] — 2026-11-05
+
+### Corrigé
+
+- Une ressource retirée de la source (HTTP 404 ou 410) ne fait plus échouer le téléchargement si les départements
+  demandés restent couverts par les autres zip. Un avertissement la signale. Si un département manque, ou si toute la
+  France est demandée, le téléchargement échoue toujours, avec un message qui cite la ressource
+
 ## [0.2.0] — 2026-10-26
 
 ### Ajouté

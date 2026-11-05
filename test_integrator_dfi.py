@@ -4,6 +4,7 @@ import re
 import tempfile
 import unittest
 import unittest.mock
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -263,6 +264,48 @@ class DownloadTest(unittest.TestCase):
         api = self.make_api([resource("id38", "DFI (situation juillet 2026).zip", zip38.as_uri())])
         with self.assertRaises(dfi_data.DownloadError):
             dfi_data.download(["38", "69"], self.tmp / "out", self.tmp / "cache", api_url=api, log=lambda m: None)
+
+    def dead_resource_setup(self):
+        zip38 = self.make_zip("a.zip", {"dfiano-dep380-01072026.txt": SAMPLE})
+        return self.make_api([
+            resource("dead", "DFI (situation juillet 2026) - dept2A0 à dept49.zip", "https://example.invalid/mort.zip"),
+            resource("id38", "DFI (situation juillet 2026) - dept2A à dept49.zip", zip38.as_uri()),
+        ])
+
+    def fetcher(self, status=404):
+        real = dfi_data.download_file
+
+        def fetch(url, destination):
+            if "example.invalid" in url:
+                raise urllib.error.HTTPError(url, status, "erreur", None, None)
+            return real(url, destination)
+        return unittest.mock.patch.object(dfi_data, "download_file", fetch)
+
+    def test_dead_resource_is_ignored_when_departments_are_covered(self):
+        api, logs = self.dead_resource_setup(), []
+        out, cache = self.tmp / "out", self.tmp / "cache"
+        with self.fetcher():
+            index, _ = dfi_data.download(["38"], out, cache, api_url=api, log=logs.append)
+            self.assertIn("38001", index["communes"])
+            self.assertTrue(any("indisponible (HTTP 404)" in m and "dept2A0" in m for m in logs))
+            # La ressource morte reste dans l'index : pas de régénération à chaque exécution.
+            self.assertEqual(index["ressources"], ["dead", "id38"])
+            self.assertIsNone(dfi_data.download(["38"], out, cache, api_url=api, log=lambda m: None))
+
+    def test_dead_resource_fails_when_department_is_missing(self):
+        api = self.dead_resource_setup()
+        with self.fetcher(), self.assertRaisesRegex(dfi_data.DownloadError, r"absents des zip : 690.*indisponibles.*dept2A0"):
+            dfi_data.download(["38", "69"], self.tmp / "out", self.tmp / "cache", api_url=api, log=lambda m: None)
+
+    def test_dead_resource_fails_for_all_departments(self):
+        api = self.dead_resource_setup()
+        with self.fetcher(), self.assertRaisesRegex(dfi_data.DownloadError, "toute la France"):
+            dfi_data.download(["all"], self.tmp / "out", self.tmp / "cache", api_url=api, log=lambda m: None)
+
+    def test_server_error_is_not_ignored(self):
+        api = self.dead_resource_setup()
+        with self.fetcher(503), self.assertRaises(urllib.error.HTTPError):
+            dfi_data.download(["38"], self.tmp / "out", self.tmp / "cache", api_url=api, log=lambda m: None)
 
     def test_rejects_unsafe_scheme_and_truncated_download(self):
         with unittest.mock.patch.object(dfi_data, "ALLOWED_SCHEMES", ("https",)):
